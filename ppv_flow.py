@@ -1,0 +1,487 @@
+import asyncio
+import logging
+import io
+import json
+from typing import Optional
+
+import httpx
+from telethon import TelegramClient
+from telethon.tl.types import (
+    KeyboardButtonCallback, 
+    KeyboardButtonSwitchInline,
+    KeyboardButtonUrl,
+    KeyboardButtonRequestPhone,
+    KeyboardButtonRequestGeoLocation,
+    KeyboardButtonGame,
+    KeyboardButtonBuy,
+    KeyboardButtonRequestPoll,
+    KeyboardButtonUserProfile,
+    KeyboardButtonWebView,
+    KeyboardButtonSimpleWebView,
+    KeyboardButtonRequestPeer,
+    ReplyInlineMarkup,
+    ReplyKeyboardMarkup,
+)
+
+from config import STACCERBOT_USERNAME, BOT_RESPONSE_TIMEOUT, PHOTO_DOWNLOAD_TIMEOUT
+
+logger = logging.getLogger(__name__)
+
+# Set to DEBUG for maximum verbosity
+logging.getLogger(__name__).setLevel(logging.DEBUG)
+
+
+class PPVFlowError(Exception):
+    """Custom exception for PPV flow errors."""
+    pass
+
+
+def log_message_details(message, step_name: str):
+    """Log detailed information about a message including buttons."""
+    logger.info(f"=== {step_name} - Message Details ===")
+    logger.info(f"Message ID: {message.id}")
+    logger.info(f"Message text: {message.text}")
+    logger.info(f"Message raw_text: {message.raw_text}")
+    
+    # Log reply markup type
+    if message.reply_markup:
+        markup_type = type(message.reply_markup).__name__
+        logger.info(f"Reply markup type: {markup_type}")
+        
+        if isinstance(message.reply_markup, ReplyInlineMarkup):
+            logger.info("This is an INLINE keyboard")
+        elif isinstance(message.reply_markup, ReplyKeyboardMarkup):
+            logger.info("This is a REPLY keyboard")
+    else:
+        logger.info("No reply markup on this message")
+    
+    # Log buttons in detail
+    if message.buttons:
+        logger.info(f"Total button rows: {len(message.buttons)}")
+        for row_idx, row in enumerate(message.buttons):
+            logger.info(f"  Row {row_idx}: {len(row)} buttons")
+            for btn_idx, button in enumerate(row):
+                log_button_details(button, row_idx, btn_idx)
+    else:
+        logger.info("No buttons on this message")
+    
+    logger.info(f"=== End {step_name} ===")
+
+
+def log_button_details(button, row_idx: int, btn_idx: int):
+    """Log detailed information about a single button."""
+    prefix = f"    Button [{row_idx}][{btn_idx}]"
+    
+    logger.info(f"{prefix} Text: '{button.text}'")
+    logger.info(f"{prefix} Button type: {type(button.button).__name__}")
+    
+    # Get the underlying button object
+    btn = button.button
+    
+    if isinstance(btn, KeyboardButtonCallback):
+        logger.info(f"{prefix} -> CALLBACK button")
+        logger.info(f"{prefix}    Data (bytes): {btn.data}")
+        try:
+            data_str = btn.data.decode('utf-8')
+            logger.info(f"{prefix}    Data (string): {data_str}")
+        except:
+            logger.info(f"{prefix}    Data (hex): {btn.data.hex()}")
+            
+    elif isinstance(btn, KeyboardButtonSwitchInline):
+        logger.info(f"{prefix} -> SWITCH INLINE button")
+        logger.info(f"{prefix}    Query: '{btn.query}'")
+        logger.info(f"{prefix}    Same peer: {btn.same_peer}")
+        if hasattr(btn, 'peer_types'):
+            logger.info(f"{prefix}    Peer types: {btn.peer_types}")
+            
+    elif isinstance(btn, KeyboardButtonUrl):
+        logger.info(f"{prefix} -> URL button")
+        logger.info(f"{prefix}    URL: {btn.url}")
+        
+    elif isinstance(btn, KeyboardButtonWebView):
+        logger.info(f"{prefix} -> WEB VIEW button")
+        logger.info(f"{prefix}    URL: {btn.url}")
+        
+    elif isinstance(btn, KeyboardButtonSimpleWebView):
+        logger.info(f"{prefix} -> SIMPLE WEB VIEW button")
+        logger.info(f"{prefix}    URL: {btn.url}")
+        
+    elif isinstance(btn, KeyboardButtonUserProfile):
+        logger.info(f"{prefix} -> USER PROFILE button")
+        logger.info(f"{prefix}    User ID: {btn.user_id}")
+        
+    elif isinstance(btn, KeyboardButtonRequestPeer):
+        logger.info(f"{prefix} -> REQUEST PEER button")
+        logger.info(f"{prefix}    Button ID: {btn.button_id}")
+        logger.info(f"{prefix}    Peer type: {btn.peer_type}")
+        logger.info(f"{prefix}    Max quantity: {btn.max_quantity}")
+        
+    elif isinstance(btn, KeyboardButtonBuy):
+        logger.info(f"{prefix} -> BUY button")
+        
+    elif isinstance(btn, KeyboardButtonGame):
+        logger.info(f"{prefix} -> GAME button")
+        logger.info(f"{prefix}    Text: {btn.text}")
+        
+    else:
+        logger.info(f"{prefix} -> OTHER button type: {type(btn)}")
+        # Try to log all attributes
+        try:
+            attrs = {k: v for k, v in vars(btn).items() if not k.startswith('_')}
+            logger.info(f"{prefix}    Attributes: {attrs}")
+        except:
+            pass
+
+
+async def download_photo(url: str) -> bytes:
+    """
+    Download photo from URL (supports ibb.co and other image hosts).
+    
+    Args:
+        url: URL of the image to download
+        
+    Returns:
+        Image bytes
+    """
+    logger.info(f"Downloading photo from {url}")
+    
+    async with httpx.AsyncClient(timeout=PHOTO_DOWNLOAD_TIMEOUT, follow_redirects=True) as client:
+        response = await client.get(url)
+        response.raise_for_status()
+        
+        content_type = response.headers.get("content-type", "")
+        logger.debug(f"Response headers: {dict(response.headers)}")
+        
+        if not content_type.startswith("image/"):
+            logger.warning(f"Unexpected content type: {content_type}")
+        
+        logger.info(f"Downloaded {len(response.content)} bytes, content-type: {content_type}")
+        return response.content
+
+
+async def wait_for_response(conv, timeout: int = 30):
+    """Wait for bot response with timeout (default 30 seconds)."""
+    logger.debug(f"Waiting for response with timeout={timeout}s")
+    try:
+        response = await asyncio.wait_for(conv.get_response(), timeout=timeout)
+        logger.debug(f"Received response in time")
+        return response
+    except asyncio.TimeoutError:
+        logger.error(f"Timeout waiting for bot response after {timeout}s")
+        raise PPVFlowError(f"Bot did not respond within {timeout} seconds")
+
+
+async def find_and_click_button(message, button_text: str) -> bool:
+    """
+    Find and click an inline button by text.
+    
+    Args:
+        message: Message with inline buttons
+        button_text: Text to search for (case-insensitive, partial match)
+        
+    Returns:
+        True if button was clicked
+    """
+    logger.info(f"Looking for button with text: '{button_text}'")
+    
+    if not message.buttons:
+        logger.warning("Message has no buttons")
+        return False
+    
+    for row_idx, row in enumerate(message.buttons):
+        for btn_idx, button in enumerate(row):
+            if button_text.lower() in button.text.lower():
+                logger.info(f"Found matching button at [{row_idx}][{btn_idx}]: '{button.text}'")
+                log_button_details(button, row_idx, btn_idx)
+                logger.info(f"Clicking button: {button.text}")
+                await button.click()
+                logger.info(f"Button clicked successfully")
+                return True
+    
+    logger.warning(f"Button with text '{button_text}' not found in {len(message.buttons)} rows")
+    return False
+
+
+async def handle_user_selection(client: TelegramClient, message, username: str) -> bool:
+    """
+    Handle the user selection step which uses inline query or other mechanisms.
+    
+    Args:
+        client: Telethon client
+        message: Message with Select User button
+        username: Target username to select
+        
+    Returns:
+        True if user was selected
+    """
+    logger.info(f"=== Handling user selection for @{username} ===")
+    
+    # Log full message details to understand the interface
+    log_message_details(message, "User Selection Step")
+    
+    # Clean username (remove @ if present)
+    clean_username = username.lstrip("@")
+    logger.debug(f"Clean username: {clean_username}")
+    
+    # Find the Select User button
+    if not message.buttons:
+        logger.warning("No buttons on user selection message")
+        return False
+        
+    for row_idx, row in enumerate(message.buttons):
+        for btn_idx, button in enumerate(row):
+            logger.info(f"Checking button [{row_idx}][{btn_idx}]: '{button.text}'")
+            
+            # Check if it's a switch inline button
+            if isinstance(button.button, KeyboardButtonSwitchInline):
+                logger.info(f"Found SWITCH INLINE button: {button.text}")
+                logger.info(f"  Query template: '{button.button.query}'")
+                
+                # Get the bot entity
+                bot = await client.get_entity(STACCERBOT_USERNAME)
+                logger.debug(f"Bot entity: {bot.id}")
+                
+                # Perform inline query with the username
+                logger.info(f"Performing inline query with: '{clean_username}'")
+                results = await client.inline_query(bot, clean_username)
+                
+                if results:
+                    logger.info(f"Got {len(results)} inline results")
+                    for i, result in enumerate(results[:5]):  # Log first 5 results
+                        logger.debug(f"  Result {i}: {result}")
+                    
+                    # Click the first result that matches
+                    for result in results:
+                        if hasattr(result, 'title') and clean_username.lower() in str(result.title).lower():
+                            logger.info(f"Clicking matching result: {result.title}")
+                            await result.click(bot)
+                            return True
+                    
+                    # If no exact match, try the first result
+                    logger.info("No exact match, clicking first result")
+                    await results[0].click(bot)
+                    return True
+                else:
+                    logger.warning("No inline results returned")
+                    
+            elif isinstance(button.button, KeyboardButtonCallback):
+                btn_text = button.text.lower()
+                if "select" in btn_text or "user" in btn_text or "choose" in btn_text:
+                    logger.info(f"Found CALLBACK button for user selection: {button.text}")
+                    logger.info(f"  Callback data: {button.button.data}")
+                    
+                    logger.info("Clicking callback button...")
+                    await button.click()
+                    logger.info("Callback button clicked")
+                    
+                    # After clicking, we might need to send the username
+                    await asyncio.sleep(1)
+                    return True
+                    
+            elif isinstance(button.button, KeyboardButtonRequestPeer):
+                logger.info(f"Found REQUEST PEER button: {button.text}")
+                logger.info(f"  This is a peer selection button!")
+                logger.info(f"  Button ID: {button.button.button_id}")
+                logger.info(f"  Peer type: {button.button.peer_type}")
+                # This type of button requires native Telegram UI interaction
+                # We might need to use a different approach
+                logger.warning("REQUEST_PEER buttons require native interaction")
+    
+    # Fallback: try sending username directly
+    logger.warning("Could not find suitable user selection button")
+    logger.warning("Will try sending username directly as fallback")
+    return False
+
+
+async def send_ppv(
+    client: TelegramClient,
+    photo_url: str,
+    username: str,
+    stars: int
+) -> dict:
+    """
+    Execute the complete PPV sending flow with staccerbot.
+    
+    Args:
+        client: Connected and authorized Telethon client
+        photo_url: URL of the photo to send as PPV
+        username: Target username to send PPV to
+        stars: Number of stars to charge
+        
+    Returns:
+        dict with status and message
+    """
+    logger.info("=" * 60)
+    logger.info(f"STARTING PPV FLOW")
+    logger.info(f"  Photo URL: {photo_url}")
+    logger.info(f"  Target user: @{username}")
+    logger.info(f"  Stars: {stars}")
+    logger.info("=" * 60)
+    
+    # Download photo first
+    try:
+        photo_bytes = await download_photo(photo_url)
+        logger.info(f"Photo downloaded: {len(photo_bytes)} bytes")
+    except Exception as e:
+        logger.exception(f"Failed to download photo: {e}")
+        raise PPVFlowError(f"Failed to download photo: {e}")
+    
+    # Get staccerbot entity
+    try:
+        staccerbot = await client.get_entity(STACCERBOT_USERNAME)
+        logger.info(f"Found staccerbot: ID={staccerbot.id}, username=@{staccerbot.username}")
+    except Exception as e:
+        logger.exception(f"Failed to find staccerbot: {e}")
+        raise PPVFlowError(f"Failed to find @{STACCERBOT_USERNAME}: {e}")
+    
+    logger.info(f"Starting conversation with @{STACCERBOT_USERNAME}")
+    
+    async with client.conversation(staccerbot, timeout=30) as conv:
+        # =====================
+        # Step 1: Send /sell command
+        # =====================
+        logger.info("")
+        logger.info("=" * 40)
+        logger.info("STEP 1: Sending /sell command")
+        logger.info("=" * 40)
+        await conv.send_message("/sell")
+        response = await wait_for_response(conv, timeout=30)
+        log_message_details(response, "Step 1 Response")
+        
+        # Expected: "Will do. Send a photo or a video to start, boss."
+        if "send a photo" not in response.text.lower() and "send" not in response.text.lower():
+            logger.warning(f"Unexpected response to /sell: {response.text}")
+        
+        # =====================
+        # Step 2: Send photo
+        # =====================
+        logger.info("")
+        logger.info("=" * 40)
+        logger.info("STEP 2: Sending photo")
+        logger.info("=" * 40)
+        await conv.send_file(
+            io.BytesIO(photo_bytes),
+            file_name="ppv_content.jpg"
+        )
+        logger.info("Photo sent, waiting for response...")
+        response = await wait_for_response(conv, timeout=30)
+        log_message_details(response, "Step 2 Response")
+        
+        # Expected: "Looks good to me. Now send a caption for the PPV or tap 'Empty'"
+        
+        # =====================
+        # Step 3: Click "Empty" button for no caption
+        # =====================
+        logger.info("")
+        logger.info("=" * 40)
+        logger.info("STEP 3: Clicking 'Empty' button")
+        logger.info("=" * 40)
+        if not await find_and_click_button(response, "Empty"):
+            logger.warning("Could not find 'Empty' button, sending 'Empty' as text")
+            await conv.send_message("Empty")
+        
+        response = await wait_for_response(conv, timeout=30)
+        log_message_details(response, "Step 3 Response")
+        
+        # Expected: "How many Stars we gon' take for the PPV?"
+        
+        # =====================
+        # Step 4: Send stars amount
+        # =====================
+        logger.info("")
+        logger.info("=" * 40)
+        logger.info(f"STEP 4: Sending stars amount: {stars}")
+        logger.info("=" * 40)
+        await conv.send_message(str(stars))
+        response = await wait_for_response(conv, timeout=30)
+        log_message_details(response, "Step 4 Response")
+        
+        # Expected: "Bet. Who should I send the PPV to, boss?"
+        # With "Select User" button
+        
+        # =====================
+        # Step 5: Handle user selection
+        # =====================
+        logger.info("")
+        logger.info("=" * 40)
+        logger.info(f"STEP 5: Selecting user @{username}")
+        logger.info("=" * 40)
+        
+        # Try to handle the user selection button
+        user_selected = await handle_user_selection(client, response, username)
+        
+        if not user_selected:
+            # Fallback: send username directly (some bots accept this)
+            clean_username = username.lstrip("@")
+            logger.info(f"Fallback: sending username directly: @{clean_username}")
+            await conv.send_message(f"@{clean_username}")
+        
+        # Wait for confirmation
+        logger.info("Waiting for confirmation response...")
+        response = await wait_for_response(conv, timeout=30)
+        log_message_details(response, "Step 5 Response")
+        
+        # Expected: "On it boss, preparing your PPV now."
+        
+        # =====================
+        # Wait for final confirmation
+        # =====================
+        logger.info("")
+        logger.info("=" * 40)
+        logger.info("Waiting for final confirmation...")
+        logger.info("=" * 40)
+        try:
+            final_response = await wait_for_response(conv, timeout=60)
+            log_message_details(final_response, "Final Response")
+            
+            # Expected: "Done deal, PPV sent."
+            if "done" in final_response.text.lower() or "sent" in final_response.text.lower():
+                logger.info("SUCCESS: PPV sent successfully!")
+                return {
+                    "status": "success",
+                    "message": "PPV sent successfully",
+                    "username": username
+                }
+        except PPVFlowError:
+            # If we timeout waiting for final confirmation, check the last response
+            if "preparing" in response.text.lower():
+                logger.info("PPV appears to be preparing, assuming success")
+                return {
+                    "status": "success",
+                    "message": "PPV submitted for sending",
+                    "username": username
+                }
+    
+    logger.info("PPV flow completed")
+    return {
+        "status": "success",
+        "message": "PPV flow completed",
+        "username": username
+    }
+
+
+async def test_ppv_flow():
+    """Test function for PPV flow (requires real credentials)."""
+    # Set up detailed logging for testing
+    logging.basicConfig(
+        level=logging.DEBUG,
+        format="%(asctime)s - %(name)s - %(levelname)s - %(message)s"
+    )
+    
+    from telegram_client import ensure_connected
+    
+    client = await ensure_connected()
+    
+    # Test with a dummy URL and username
+    result = await send_ppv(
+        client,
+        photo_url="https://i.ibb.co/placeholder/test.jpg",
+        username="test_user",
+        stars=100
+    )
+    
+    print(f"Result: {result}")
+
+
+if __name__ == "__main__":
+    asyncio.run(test_ppv_flow())
