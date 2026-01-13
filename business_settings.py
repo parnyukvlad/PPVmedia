@@ -46,7 +46,7 @@ async def _switch_business_bot(client: TelegramClient, bot_username: str) -> boo
         # We do this by calling update with deleted=True for the current bot
         # But since we might not know the current bot, we'll just connect the new one
         
-        # Connect the new business bot
+        # Connect the new business bot with full permissions
         result = await client(functions.account.UpdateConnectedBotRequest(
             bot=bot_entity,
             recipients=types.InputBusinessBotRecipients(
@@ -58,7 +58,9 @@ async def _switch_business_bot(client: TelegramClient, bot_username: str) -> boo
             ),
             rights=types.BusinessBotRights(
                 reply=True,
-                read_messages=True
+                read_messages=True,
+                delete_sent_messages=True,
+                delete_received_messages=True
             )
         ))
         

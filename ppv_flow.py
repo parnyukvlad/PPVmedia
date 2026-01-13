@@ -21,7 +21,9 @@ from telethon.tl.types import (
     KeyboardButtonRequestPeer,
     ReplyInlineMarkup,
     ReplyKeyboardMarkup,
+    InputPeerUser,
 )
+from telethon.tl.functions.messages import SendBotRequestedPeerRequest
 
 from config import STACCERBOT_USERNAME, BOT_RESPONSE_TIMEOUT, PHOTO_DOWNLOAD_TIMEOUT
 
@@ -202,17 +204,21 @@ async def find_and_click_button(message, button_text: str) -> bool:
     return False
 
 
-async def handle_user_selection(client: TelegramClient, message, username: str) -> bool:
+async def handle_user_selection(client: TelegramClient, conv, message, username: str):
     """
-    Handle the user selection step which uses inline query or other mechanisms.
+    Handle the user selection step using SendBotRequestedPeerRequest.
+    
+    The "Select User" button is a KeyboardButtonRequestPeer which requires
+    using the SendBotRequestedPeerRequest to respond with the selected user.
     
     Args:
         client: Telethon client
+        conv: Active conversation with the bot
         message: Message with Select User button
         username: Target username to select
         
     Returns:
-        True if user was selected
+        Response message from the bot after selection
     """
     logger.info(f"=== Handling user selection for @{username} ===")
     
@@ -223,74 +229,57 @@ async def handle_user_selection(client: TelegramClient, message, username: str) 
     clean_username = username.lstrip("@")
     logger.debug(f"Clean username: {clean_username}")
     
-    # Find the Select User button
-    if not message.buttons:
-        logger.warning("No buttons on user selection message")
-        return False
-        
-    for row_idx, row in enumerate(message.buttons):
-        for btn_idx, button in enumerate(row):
-            logger.info(f"Checking button [{row_idx}][{btn_idx}]: '{button.text}'")
-            
-            # Check if it's a switch inline button
-            if isinstance(button.button, KeyboardButtonSwitchInline):
-                logger.info(f"Found SWITCH INLINE button: {button.text}")
-                logger.info(f"  Query template: '{button.button.query}'")
-                
-                # Get the bot entity
-                bot = await client.get_entity(STACCERBOT_USERNAME)
-                logger.debug(f"Bot entity: {bot.id}")
-                
-                # Perform inline query with the username
-                logger.info(f"Performing inline query with: '{clean_username}'")
-                results = await client.inline_query(bot, clean_username)
-                
-                if results:
-                    logger.info(f"Got {len(results)} inline results")
-                    for i, result in enumerate(results[:5]):  # Log first 5 results
-                        logger.debug(f"  Result {i}: {result}")
-                    
-                    # Click the first result that matches
-                    for result in results:
-                        if hasattr(result, 'title') and clean_username.lower() in str(result.title).lower():
-                            logger.info(f"Clicking matching result: {result.title}")
-                            await result.click(bot)
-                            return True
-                    
-                    # If no exact match, try the first result
-                    logger.info("No exact match, clicking first result")
-                    await results[0].click(bot)
-                    return True
-                else:
-                    logger.warning("No inline results returned")
-                    
-            elif isinstance(button.button, KeyboardButtonCallback):
-                btn_text = button.text.lower()
-                if "select" in btn_text or "user" in btn_text or "choose" in btn_text:
-                    logger.info(f"Found CALLBACK button for user selection: {button.text}")
-                    logger.info(f"  Callback data: {button.button.data}")
-                    
-                    logger.info("Clicking callback button...")
-                    await button.click()
-                    logger.info("Callback button clicked")
-                    
-                    # After clicking, we might need to send the username
-                    await asyncio.sleep(1)
-                    return True
-                    
-            elif isinstance(button.button, KeyboardButtonRequestPeer):
-                logger.info(f"Found REQUEST PEER button: {button.text}")
-                logger.info(f"  This is a peer selection button!")
-                logger.info(f"  Button ID: {button.button.button_id}")
-                logger.info(f"  Peer type: {button.button.peer_type}")
-                # This type of button requires native Telegram UI interaction
-                # We might need to use a different approach
-                logger.warning("REQUEST_PEER buttons require native interaction")
+    # Find the RequestPeer button
+    button_id = None
+    if message.reply_markup:
+        for row in message.reply_markup.rows:
+            for button in row.buttons:
+                if isinstance(button, KeyboardButtonRequestPeer):
+                    button_id = button.button_id
+                    logger.info(f"Found RequestPeer button with ID: {button_id}")
+                    logger.info(f"  Peer type: {button.peer_type}")
+                    break
+            if button_id is not None:
+                break
     
-    # Fallback: try sending username directly
-    logger.warning("Could not find suitable user selection button")
-    logger.warning("Will try sending username directly as fallback")
-    return False
+    if button_id is None:
+        logger.error("Could not find RequestPeer button in message")
+        raise PPVFlowError("Could not find user selection button")
+    
+    # Get the target user entity
+    try:
+        target_user = await client.get_entity(clean_username)
+        logger.info(f"Found target user: ID={target_user.id}, name={target_user.first_name}")
+    except Exception as e:
+        logger.error(f"Could not find user @{clean_username}: {e}")
+        raise PPVFlowError(f"Could not find user @{clean_username}: {e}")
+    
+    # Get the bot entity (staccerbot)
+    staccerbot = await client.get_entity(STACCERBOT_USERNAME)
+    logger.info(f"Sending requested peer to bot (msg_id={message.id}, button_id={button_id})")
+    
+    # Send the selected peer to the bot using SendBotRequestedPeerRequest
+    try:
+        result = await client(SendBotRequestedPeerRequest(
+            peer=staccerbot,
+            msg_id=message.id,
+            button_id=button_id,
+            requested_peers=[InputPeerUser(
+                user_id=target_user.id,
+                access_hash=target_user.access_hash
+            )]
+        ))
+        logger.info(f"SendBotRequestedPeerRequest successful: {result}")
+    except Exception as e:
+        logger.error(f"SendBotRequestedPeerRequest failed: {e}")
+        raise PPVFlowError(f"Failed to select user: {e}")
+    
+    # Wait for bot confirmation
+    logger.info("Waiting for bot response after user selection...")
+    response = await wait_for_response(conv, timeout=30)
+    log_message_details(response, "User Selection Response")
+    
+    return response
 
 
 async def send_ppv(
@@ -359,9 +348,13 @@ async def send_ppv(
         logger.info("=" * 40)
         logger.info("STEP 2: Sending photo")
         logger.info("=" * 40)
+        # Create BytesIO with name attribute so Telethon recognizes it as an image
+        photo_file = io.BytesIO(photo_bytes)
+        photo_file.name = "photo.jpg"  # This tells Telethon it's an image
+        
         await conv.send_file(
-            io.BytesIO(photo_bytes),
-            file_name="ppv_content.jpg"
+            photo_file,
+            force_document=False  # Send as photo/image, not as document
         )
         logger.info("Photo sent, waiting for response...")
         response = await wait_for_response(conv, timeout=30)
@@ -400,26 +393,71 @@ async def send_ppv(
         # With "Select User" button
         
         # =====================
-        # Step 5: Handle user selection
+        # Step 5: Handle user selection (with retry logic)
         # =====================
         logger.info("")
         logger.info("=" * 40)
         logger.info(f"STEP 5: Selecting user @{username}")
         logger.info("=" * 40)
         
-        # Try to handle the user selection button
-        user_selected = await handle_user_selection(client, response, username)
+        max_retries = 2
+        retry_count = 0
         
-        if not user_selected:
-            # Fallback: send username directly (some bots accept this)
-            clean_username = username.lstrip("@")
-            logger.info(f"Fallback: sending username directly: @{clean_username}")
-            await conv.send_message(f"@{clean_username}")
-        
-        # Wait for confirmation
-        logger.info("Waiting for confirmation response...")
-        response = await wait_for_response(conv, timeout=30)
-        log_message_details(response, "Step 5 Response")
+        while retry_count <= max_retries:
+            # Handle the user selection using SendBotRequestedPeerRequest
+            response = await handle_user_selection(client, conv, response, username)
+            
+            # Check for "no exchange in 48h" error
+            if "no exchange" in response.text.lower() or "48h" in response.text.lower():
+                retry_count += 1
+                logger.warning(f"Got 'no exchange in 48h' error (retry {retry_count}/{max_retries})")
+                
+                if retry_count > max_retries:
+                    logger.error("Max retries exceeded for establishing contact")
+                    raise PPVFlowError("Cannot send PPV: no recent exchange with user and retries exhausted")
+                
+                # Need to establish contact first by sending a quick message
+                logger.info(f"Establishing contact with @{username}...")
+                
+                try:
+                    # Get target user entity
+                    clean_username = username.lstrip("@")
+                    target_user = await client.get_entity(clean_username)
+                    
+                    # Send a quick message to the target user
+                    quick_msg = await client.send_message(target_user, "Hey! 👋")
+                    logger.info(f"Sent quick message to @{username}, message ID: {quick_msg.id}")
+                    
+                    # Wait a bit
+                    await asyncio.sleep(2)
+                    
+                    # Delete the message
+                    await quick_msg.delete()
+                    logger.info("Quick message deleted")
+                    
+                except Exception as e:
+                    logger.error(f"Failed to send/delete quick message: {e}")
+                    # Continue anyway, try the retry button
+                
+                # Click "Try again" button
+                logger.info("Clicking 'Try again' button...")
+                try:
+                    await response.click(data=b"sell_refresh")
+                    logger.info("Clicked 'Try again' button")
+                except Exception as e:
+                    logger.warning(f"Could not click by data, trying by text: {e}")
+                    if not await find_and_click_button(response, "Try again"):
+                        raise PPVFlowError("Could not find 'Try again' button")
+                
+                # Wait for bot to ask for user selection again
+                response = await wait_for_response(conv, timeout=30)
+                log_message_details(response, "After Try Again Response")
+                
+                # Continue the loop to try user selection again
+                continue
+            
+            # If no error, break out of retry loop
+            break
         
         # Expected: "On it boss, preparing your PPV now."
         
